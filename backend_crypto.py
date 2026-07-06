@@ -1,3 +1,4 @@
+
 import hashlib
 import hmac
 import json
@@ -138,6 +139,8 @@ def create_crypto_pay_invoice(order_id, usdt_amount):
         data=body,
         headers={
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "YouWinMiniApp/1.0 (+https://youwin-backend.onrender.com)",
             "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
         },
         method="POST",
@@ -296,6 +299,19 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if url.path == "/api/balance":
+            user_id = params.get("user_id", [""])[0]
+            if not user_id:
+                json_response(self, 400, {"ok": False, "error": "user_id_required"})
+                return
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                row = conn.execute(
+                    "SELECT balance FROM balances WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
+            json_response(self, 200, {"ok": True, "balance": int(row[0]) if row else 0})
+            return
+
         json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
@@ -354,6 +370,74 @@ class Handler(BaseHTTPRequestHandler):
                         "usdt_amount": usdt_amount,
                         "nc_amount": nc_amount,
                         "provider": PAYMENT_PROVIDER,
+                    },
+                )
+            except Exception as error:
+                json_response(self, 400, {"ok": False, "error": str(error)})
+            return
+
+        if url.path == "/api/deposit/register-cryptopay":
+            try:
+                user_id = str(payload.get("user_id", "")).strip()
+                order_id = str(payload.get("order_id", "")).strip()
+                invoice_url = str(payload.get("invoice_url", "")).strip()
+                provider_payment_id = str(payload.get("provider_payment_id", "")).strip()
+                usdt_amount = float(payload.get("usdt_amount", 0))
+                if not user_id:
+                    raise ValueError("user_id_required")
+                if not order_id:
+                    raise ValueError("order_id_required")
+                if not invoice_url:
+                    raise ValueError("invoice_url_required")
+                if usdt_amount <= 0:
+                    raise ValueError("amount_must_be_positive")
+
+                nc_amount = int(usdt_amount * NC_PER_USDT)
+                now = int(time.time())
+                with sqlite3.connect(DATABASE_PATH) as conn:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO deposits (
+                            order_id, user_id, usdt_amount, nc_amount,
+                            provider_payment_id, invoice_url, raw_provider_json,
+                            created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(order_id) DO UPDATE SET
+                            invoice_url = excluded.invoice_url,
+                            provider_payment_id = excluded.provider_payment_id,
+                            raw_provider_json = excluded.raw_provider_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            order_id,
+                            user_id,
+                            usdt_amount,
+                            nc_amount,
+                            provider_payment_id,
+                            invoice_url,
+                            json.dumps(payload),
+                            now,
+                            now,
+                        ),
+                    )
+                    row = conn.execute(
+                        "SELECT id FROM deposits WHERE order_id = ?",
+                        (order_id,),
+                    ).fetchone()
+                    deposit_id = row[0] if row else cursor.lastrowid
+
+                json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "deposit_id": deposit_id,
+                        "order_id": order_id,
+                        "invoice_url": invoice_url,
+                        "usdt_amount": usdt_amount,
+                        "nc_amount": nc_amount,
+                        "provider": "cryptopay",
                     },
                 )
             except Exception as error:
