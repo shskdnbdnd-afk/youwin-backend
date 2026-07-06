@@ -6,6 +6,7 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -28,7 +29,7 @@ def load_env(path=ENV_PATH):
 load_env()
 
 HOST = os.getenv("CRYPTO_BACKEND_HOST", "0.0.0.0")
-PORT = int(os.getenv("CRYPTO_BACKEND_PORT", "8787"))
+PORT = int(os.getenv("PORT", os.getenv("CRYPTO_BACKEND_PORT", "8787")))
 DATABASE_PATH = BASE_DIR / os.getenv("CRYPTO_DATABASE_PATH", "crypto_deposits.sqlite3")
 WEB_APP_ORIGIN = os.getenv("WEB_APP_ORIGIN", "https://bucolic-paprenjak-5d3093.netlify.app")
 BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "").rstrip("/")
@@ -131,8 +132,12 @@ def create_nowpayments_invoice(order_id, usdt_amount):
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=35) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"NOWPayments HTTP {error.code}: {details}") from error
 
 
 def credit_deposit(order_id, provider_status, raw_payload):
