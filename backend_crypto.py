@@ -43,8 +43,6 @@ PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "cryptopay").strip().lower()
 CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN", "")
 CRYPTO_PAY_API_BASE = os.getenv("CRYPTO_PAY_API_BASE", "https://pay.crypt.bot")
 CRYPTO_PAY_ASSET = os.getenv("CRYPTO_PAY_ASSET", "USDT")
-BALANCE_PER_USDT = Decimal(os.getenv("BALANCE_PER_USDT", os.getenv("NC_PER_USDT", "1")))
-
 CRYPTO_PAY_PAID_STATUSES = {"paid"}
 SUPPORTED_CRYPTO_PAY_ASSETS = {"USDT", "TON", "BTC", "ETH", "LTC", "BNB", "TRX", "USDC"}
 SUPPORTED_PROVIDERS = {"cryptopay", "telegram_wallet"}
@@ -60,6 +58,7 @@ def setup_database():
                 user_id TEXT NOT NULL,
                 usdt_amount REAL NOT NULL,
                 nc_amount REAL NOT NULL,
+                crypto_asset TEXT NOT NULL DEFAULT 'USDT',
                 provider_payment_id TEXT,
                 invoice_url TEXT,
                 status TEXT NOT NULL DEFAULT 'waiting',
@@ -76,12 +75,25 @@ def setup_database():
         }
         if "provider" not in columns:
             conn.execute("ALTER TABLE deposits ADD COLUMN provider TEXT NOT NULL DEFAULT 'cryptopay'")
+        if "crypto_asset" not in columns:
+            conn.execute("ALTER TABLE deposits ADD COLUMN crypto_asset TEXT NOT NULL DEFAULT 'USDT'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS balances (
                 user_id TEXT PRIMARY KEY,
                 balance REAL NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS asset_balances (
+                user_id TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                balance REAL NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, asset)
             )
             """
         )
@@ -164,44 +176,23 @@ def crypto_pay_api(method, payload=None):
     return data.get("result")
 
 
-def get_crypto_pay_amount(usdt_amount, crypto_asset):
-    crypto_asset = clean_crypto_asset(crypto_asset)
-    if crypto_asset in {"USDT", "USDC"}:
-        return format_crypto_amount(usdt_amount)
-
-    rates = crypto_pay_api("getExchangeRates") or []
-    usdt_amount_decimal = Decimal(str(usdt_amount))
-    for rate in rates:
-        source = str(rate.get("source", "")).upper()
-        target = str(rate.get("target", "")).upper()
-        value = Decimal(str(rate.get("rate", "0")))
-        if value <= 0:
-            continue
-        if source == crypto_asset and target == "USDT":
-            return format_crypto_amount(usdt_amount_decimal / value)
-        if source == "USDT" and target == crypto_asset:
-            return format_crypto_amount(usdt_amount_decimal * value)
-
-    raise RuntimeError(f"exchange_rate_missing: USDT/{crypto_asset}")
-
-
-def create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset=None):
+def create_crypto_pay_invoice(order_id, pay_amount, crypto_asset=None):
     if not CRYPTO_PAY_API_TOKEN:
         raise RuntimeError("CRYPTO_PAY_API_TOKEN is missing in environment variables")
     if not BACKEND_PUBLIC_URL:
         raise RuntimeError("BACKEND_PUBLIC_URL is missing in environment variables")
 
     crypto_asset = clean_crypto_asset(crypto_asset)
-    crypto_amount = get_crypto_pay_amount(usdt_amount, crypto_asset)
+    crypto_amount = format_crypto_amount(pay_amount)
     payload = {
         "asset": crypto_asset,
         "amount": crypto_amount,
-        "description": f"YouWin {usdt_amount:g} USDT top up",
+        "description": f"YouWin {crypto_amount} {crypto_asset} top up",
         "payload": order_id,
         "expires_in": 3600,
     }
     provider = crypto_pay_api("createInvoice", payload) or {}
-    provider["youwin_usdt_amount"] = usdt_amount
+    provider["youwin_pay_amount"] = pay_amount
     provider["youwin_crypto_asset"] = crypto_asset
     provider["youwin_crypto_amount"] = crypto_amount
     return provider
@@ -247,6 +238,7 @@ def credit_deposit(order_id, provider_status, raw_payload, paid_statuses=None):
         already_credited = bool(deposit["credited"])
         should_credit = provider_status in paid_statuses and not already_credited
         if should_credit:
+            asset = str(deposit["crypto_asset"] or "USDT").upper()
             conn.execute(
                 """
                 INSERT INTO balances (user_id, balance, updated_at)
@@ -256,6 +248,16 @@ def credit_deposit(order_id, provider_status, raw_payload, paid_statuses=None):
                     updated_at = excluded.updated_at
                 """,
                 (deposit["user_id"], deposit["nc_amount"], now),
+            )
+            conn.execute(
+                """
+                INSERT INTO asset_balances (user_id, asset, balance, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, asset) DO UPDATE SET
+                    balance = balance + excluded.balance,
+                    updated_at = excluded.updated_at
+                """,
+                (deposit["user_id"], asset, deposit["nc_amount"], now),
             )
 
         conn.execute(
@@ -298,7 +300,7 @@ class Handler(BaseHTTPRequestHandler):
             with sqlite3.connect(DATABASE_PATH) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
-                    "SELECT status, credited, nc_amount, provider FROM deposits WHERE id = ?",
+                    "SELECT status, credited, nc_amount, crypto_asset, provider FROM deposits WHERE id = ?",
                     (deposit_id,),
                 ).fetchone()
             if not row:
@@ -312,6 +314,7 @@ class Handler(BaseHTTPRequestHandler):
                     "status": row["status"],
                     "credited": bool(row["credited"]),
                     "nc_amount": row["nc_amount"],
+                    "crypto_asset": row["crypto_asset"],
                     "provider": row["provider"],
                 },
             )
@@ -325,7 +328,7 @@ class Handler(BaseHTTPRequestHandler):
                 if usdt_amount <= 0:
                     raise ValueError("amount_must_be_positive")
 
-                nc_amount = float(Decimal(str(usdt_amount)) * BALANCE_PER_USDT)
+                nc_amount = usdt_amount
                 order_id = f"YW-{user_id}-{int(time.time())}"
                 provider = create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset)
                 invoice_url = provider_invoice_url(provider)
@@ -338,16 +341,17 @@ class Handler(BaseHTTPRequestHandler):
                         """
                         INSERT INTO deposits (
                             order_id, user_id, usdt_amount, nc_amount,
-                            provider, provider_payment_id, invoice_url, raw_provider_json,
+                            crypto_asset, provider, provider_payment_id, invoice_url, raw_provider_json,
                             created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             order_id,
                             user_id,
                             usdt_amount,
                             nc_amount,
+                            crypto_asset,
                             "cryptopay",
                             provider_payment_id,
                             invoice_url,
@@ -364,15 +368,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/api/balance":
             user_id = params.get("user_id", [""])[0]
+            crypto_asset = clean_crypto_asset(params.get("asset", ["USDT"])[0])
             if not user_id:
                 json_response(self, 400, {"ok": False, "error": "user_id_required"})
                 return
             with sqlite3.connect(DATABASE_PATH) as conn:
                 row = conn.execute(
-                    "SELECT balance FROM balances WHERE user_id = ?",
-                    (user_id,),
+                    "SELECT balance FROM asset_balances WHERE user_id = ? AND asset = ?",
+                    (user_id, crypto_asset),
                 ).fetchone()
-            json_response(self, 200, {"ok": True, "balance": float(row[0]) if row else 0})
+            json_response(self, 200, {"ok": True, "asset": crypto_asset, "balance": float(row[0]) if row else 0})
             return
 
         json_response(self, 404, {"ok": False, "error": "not_found"})
@@ -392,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
                 if usdt_amount <= 0:
                     raise ValueError("amount_must_be_positive")
 
-                nc_amount = float(Decimal(str(usdt_amount)) * BALANCE_PER_USDT)
+                nc_amount = usdt_amount
                 order_id = f"YW-{user_id}-{int(time.time())}"
                 provider = create_provider_invoice(provider_name, order_id, usdt_amount, crypto_asset)
                 invoice_url = provider_invoice_url(provider)
@@ -405,16 +410,17 @@ class Handler(BaseHTTPRequestHandler):
                         """
                         INSERT INTO deposits (
                             order_id, user_id, usdt_amount, nc_amount,
-                            provider, provider_payment_id, invoice_url, raw_provider_json,
+                            crypto_asset, provider, provider_payment_id, invoice_url, raw_provider_json,
                             created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             order_id,
                             user_id,
                             usdt_amount,
                             nc_amount,
+                            crypto_asset,
                             provider_name,
                             provider_payment_id,
                             invoice_url,
@@ -459,20 +465,22 @@ class Handler(BaseHTTPRequestHandler):
                 if usdt_amount <= 0:
                     raise ValueError("amount_must_be_positive")
 
-                nc_amount = float(Decimal(str(usdt_amount)) * BALANCE_PER_USDT)
+                crypto_asset = clean_crypto_asset(payload.get("crypto_asset"))
+                nc_amount = usdt_amount
                 now = int(time.time())
                 with sqlite3.connect(DATABASE_PATH) as conn:
                     cursor = conn.execute(
                         """
                         INSERT INTO deposits (
                             order_id, user_id, usdt_amount, nc_amount,
-                            provider, provider_payment_id, invoice_url, raw_provider_json,
+                            crypto_asset, provider, provider_payment_id, invoice_url, raw_provider_json,
                             created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(order_id) DO UPDATE SET
                             invoice_url = excluded.invoice_url,
                             provider_payment_id = excluded.provider_payment_id,
+                            crypto_asset = excluded.crypto_asset,
                             provider = excluded.provider,
                             raw_provider_json = excluded.raw_provider_json,
                             updated_at = excluded.updated_at
@@ -482,6 +490,7 @@ class Handler(BaseHTTPRequestHandler):
                             user_id,
                             usdt_amount,
                             nc_amount,
+                            crypto_asset,
                             "cryptopay",
                             provider_payment_id,
                             invoice_url,
@@ -506,6 +515,7 @@ class Handler(BaseHTTPRequestHandler):
                         "invoice_url": invoice_url,
                         "usdt_amount": usdt_amount,
                         "nc_amount": nc_amount,
+                        "crypto_asset": crypto_asset,
                         "provider": "cryptopay",
                     },
                 )
@@ -538,10 +548,4 @@ def main():
     setup_database()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"YouWin crypto backend running on http://{HOST}:{PORT}")
-    print("Provider:", PAYMENT_PROVIDER)
-    print("Crypto Pay webhook URL:", f"{BACKEND_PUBLIC_URL}/api/deposit/webhook/cryptopay")
-    server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
+    print("Provider
