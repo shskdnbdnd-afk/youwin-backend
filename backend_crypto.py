@@ -46,7 +46,26 @@ CRYPTO_PAY_ASSET = os.getenv("CRYPTO_PAY_ASSET", "USDT")
 TELEGRAM_WALLET_URL = os.getenv("TELEGRAM_WALLET_URL", "https://t.me/wallet")
 CRYPTO_PAY_PAID_STATUSES = {"paid"}
 SUPPORTED_CRYPTO_PAY_ASSETS = {"USDT", "TON", "BTC", "ETH"}
-SUPPORTED_PROVIDERS = {"cryptopay", "telegram_wallet"}
+SUPPORTED_PROVIDERS = {"cryptopay", "direct_crypto"}
+
+DIRECT_WALLETS = {
+    "USDT": {
+        "network": "TRC20",
+        "address": os.getenv("DIRECT_USDT_TRC20_ADDRESS", "THX7cd5voYJKHGKwhcA7SWwsqBJT8HTepB"),
+    },
+    "TON": {
+        "network": "TON",
+        "address": os.getenv("DIRECT_TON_ADDRESS", "UQCf82JLZi2zzfQ_zGnzTNDGaL4MJVEFtA7kuA4ks07q00Vg"),
+    },
+    "BTC": {
+        "network": "BTC",
+        "address": os.getenv("DIRECT_BTC_ADDRESS", "bc1q4pl0q29yvpl3ut6rpvcjvkcxr8sh3swxpafthv"),
+    },
+    "ETH": {
+        "network": "ERC20",
+        "address": os.getenv("DIRECT_ETH_ADDRESS", "0x3efeDfFaD839006b3DDa4543fcd6b1909f8Ba9E7"),
+    },
+}
 
 
 def setup_database():
@@ -152,6 +171,19 @@ def format_crypto_amount(value):
     return format(quantized.normalize(), "f")
 
 
+def direct_unique_amount(base_amount, order_id, crypto_asset):
+    decimals = Decimal("0.00000001") if crypto_asset in {"BTC", "ETH"} else Decimal("0.0001")
+    tail = (int(hashlib.sha1(order_id.encode("utf-8")).hexdigest()[:6], 16) % 7000) + 1000
+    multiplier = Decimal(tail) if crypto_asset in {"BTC", "ETH"} else Decimal(tail % 900 + 100)
+    return (Decimal(str(base_amount)) + decimals * multiplier).quantize(decimals, rounding=ROUND_DOWN)
+
+
+def http_get_json(url, headers=None):
+    request = urllib.request.Request(url, headers=headers or {}, method="GET")
+    with urllib.request.urlopen(request, timeout=25) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def crypto_pay_api(method, payload=None):
     body = json.dumps(payload or {}).encode("utf-8")
     request = urllib.request.Request(
@@ -199,34 +231,128 @@ def create_crypto_pay_invoice(order_id, pay_amount, crypto_asset=None):
     return provider
 
 
-def create_telegram_wallet_payment(order_id, pay_amount, crypto_asset=None):
-    crypto_asset = clean_crypto_asset(crypto_asset)
-    crypto_amount = format_crypto_amount(pay_amount)
-    query = urllib.parse.urlencode(
-        {
-            "start": f"youwin_{order_id}_{crypto_amount}_{crypto_asset}",
-        }
-    )
-    wallet_url = TELEGRAM_WALLET_URL
-    if "?" in wallet_url:
-        invoice_url = f"{wallet_url}&{query}"
-    else:
-        invoice_url = f"{wallet_url}?{query}"
-    return {
-        "id": order_id,
-        "invoice_url": invoice_url,
-        "provider": "telegram_wallet",
-        "youwin_pay_amount": pay_amount,
-        "youwin_crypto_asset": crypto_asset,
-        "youwin_crypto_amount": crypto_amount,
-    }
-
-
 def create_provider_invoice(provider, order_id, usdt_amount, crypto_asset=None):
     provider = clean_provider(provider)
-    if provider == "telegram_wallet":
-        return create_telegram_wallet_payment(order_id, usdt_amount, crypto_asset)
+    if provider == "direct_crypto":
+        raise RuntimeError("use /api/deposit/direct/create for direct crypto")
     return create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset)
+
+
+def create_direct_crypto_payment(user_id, amount, crypto_asset):
+    crypto_asset = clean_crypto_asset(crypto_asset)
+    wallet = DIRECT_WALLETS.get(crypto_asset)
+    if not wallet or not wallet.get("address"):
+        raise RuntimeError(f"direct_wallet_missing:{crypto_asset}")
+
+    order_id = f"YW-DIRECT-{user_id}-{int(time.time())}"
+    pay_amount = direct_unique_amount(amount, order_id, crypto_asset)
+    now = int(time.time())
+    details = {
+        "provider": "direct_crypto",
+        "order_id": order_id,
+        "asset": crypto_asset,
+        "network": wallet["network"],
+        "address": wallet["address"],
+        "requested_amount": float(amount),
+        "pay_amount": float(pay_amount),
+    }
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO deposits (
+                order_id, user_id, usdt_amount, nc_amount,
+                crypto_asset, provider, provider_payment_id, invoice_url, raw_provider_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                user_id,
+                float(pay_amount),
+                float(pay_amount),
+                crypto_asset,
+                "direct_crypto",
+                "",
+                "",
+                json.dumps(details),
+                now,
+                now,
+            ),
+        )
+        details["deposit_id"] = cursor.lastrowid
+    return details
+
+
+def check_direct_payment(deposit):
+    details = json.loads(deposit["raw_provider_json"] or "{}")
+    asset = str(deposit["crypto_asset"]).upper()
+    address = details.get("address", "")
+    expected = Decimal(str(deposit["usdt_amount"]))
+    created_at = int(deposit["created_at"] or 0) - 180
+
+    if asset == "USDT":
+        url = (
+            f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20"
+            "?limit=50&contract_address=TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcd"
+        )
+        headers = {}
+        if os.getenv("TRONGRID_API_KEY"):
+            headers["TRON-PRO-API-KEY"] = os.getenv("TRONGRID_API_KEY")
+        data = http_get_json(url, headers)
+        for tx in data.get("data", []):
+            if str(tx.get("to", "")).lower() != address.lower():
+                continue
+            if int(tx.get("block_timestamp", 0)) // 1000 < created_at:
+                continue
+            decimals = int(tx.get("token_info", {}).get("decimals", 6))
+            amount = Decimal(str(tx.get("value", "0"))) / (Decimal(10) ** decimals)
+            if amount >= expected:
+                return {"found": True, "txid": tx.get("transaction_id"), "amount": float(amount), "raw": tx}
+
+    if asset == "BTC":
+        data = http_get_json(f"https://mempool.space/api/address/{address}/txs")
+        for tx in data[:50]:
+            block_time = int(tx.get("status", {}).get("block_time") or time.time())
+            if block_time < created_at:
+                continue
+            total = Decimal("0")
+            for out in tx.get("vout", []):
+                if out.get("scriptpubkey_address") == address:
+                    total += Decimal(str(out.get("value", 0))) / Decimal("100000000")
+            if total >= expected:
+                return {"found": True, "txid": tx.get("txid"), "amount": float(total), "raw": tx}
+
+    if asset == "TON":
+        data = http_get_json(f"https://tonapi.io/v2/blockchain/accounts/{address}/transactions?limit=30")
+        for tx in data.get("transactions", []):
+            now_ts = int(tx.get("utime", 0))
+            if now_ts < created_at:
+                continue
+            in_msg = tx.get("in_msg") or {}
+            if str(in_msg.get("destination", {}).get("address", "")).lower() not in {"", address.lower()}:
+                continue
+            amount = Decimal(str(in_msg.get("value", 0))) / Decimal("1000000000")
+            if amount >= expected:
+                return {"found": True, "txid": tx.get("hash"), "amount": float(amount), "raw": tx}
+
+    if asset == "ETH":
+        api_key = os.getenv("ETHERSCAN_API_KEY", "")
+        url = (
+            "https://api.etherscan.io/api?module=account&action=txlist"
+            f"&address={address}&sort=desc&page=1&offset=25&apikey={api_key}"
+        )
+        data = http_get_json(url)
+        for tx in data.get("result", []):
+            if str(tx.get("to", "")).lower() != address.lower():
+                continue
+            if int(tx.get("timeStamp", 0)) < created_at:
+                continue
+            amount = Decimal(str(tx.get("value", 0))) / Decimal("1000000000000000000")
+            if amount >= expected:
+                return {"found": True, "txid": tx.get("hash"), "amount": float(amount), "raw": tx}
+
+    return {"found": False}
 
 
 def provider_invoice_url(provider):
@@ -318,7 +444,6 @@ class Handler(BaseHTTPRequestHandler):
                     "provider": PAYMENT_PROVIDER,
                     "crypto_pay_base": CRYPTO_PAY_API_BASE,
                     "providers": sorted(SUPPORTED_PROVIDERS),
-                    "telegram_wallet_url": TELEGRAM_WALLET_URL,
                 },
             )
             return
@@ -346,6 +471,54 @@ class Handler(BaseHTTPRequestHandler):
                     "provider": row["provider"],
                 },
             )
+            return
+
+        if url.path == "/api/deposit/direct/check":
+            deposit_id = params.get("deposit_id", [""])[0]
+            if not deposit_id:
+                json_response(self, 400, {"ok": False, "error": "deposit_id_required"})
+                return
+            try:
+                with sqlite3.connect(DATABASE_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    deposit = conn.execute(
+                        "SELECT * FROM deposits WHERE id = ? AND provider = 'direct_crypto'",
+                        (deposit_id,),
+                    ).fetchone()
+                if not deposit:
+                    json_response(self, 404, {"ok": False, "error": "deposit_not_found"})
+                    return
+                if bool(deposit["credited"]):
+                    json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "credited": True,
+                            "status": deposit["status"],
+                            "nc_amount": deposit["nc_amount"],
+                            "crypto_asset": deposit["crypto_asset"],
+                        },
+                    )
+                    return
+                check = check_direct_payment(deposit)
+                if check.get("found"):
+                    result = credit_deposit(deposit["order_id"], "paid", check, {"paid"})
+                    json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "credited": True,
+                            "crypto_asset": deposit["crypto_asset"],
+                            "nc_amount": deposit["nc_amount"],
+                            **result,
+                        },
+                    )
+                    return
+                json_response(self, 200, {"ok": True, "credited": False, "status": "waiting"})
+            except Exception as error:
+                json_response(self, 400, {"ok": False, "error": str(error)})
             return
 
         if url.path == "/api/deposit/quick":
@@ -478,6 +651,21 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 400, {"ok": False, "error": str(error)})
             return
 
+        if url.path == "/api/deposit/direct/create":
+            try:
+                user_id = str(payload.get("user_id", "")).strip()
+                amount = Decimal(str(payload.get("amount", "0")))
+                crypto_asset = clean_crypto_asset(payload.get("crypto_asset"))
+                if not user_id:
+                    raise ValueError("user_id_required")
+                if amount <= 0:
+                    raise ValueError("amount_must_be_positive")
+                direct = create_direct_crypto_payment(user_id, amount, crypto_asset)
+                json_response(self, 200, {"ok": True, **direct})
+            except Exception as error:
+                json_response(self, 400, {"ok": False, "error": str(error)})
+            return
+
         if url.path == "/api/deposit/register-cryptopay":
             try:
                 user_id = str(payload.get("user_id", "")).strip()
@@ -513,7 +701,8 @@ class Handler(BaseHTTPRequestHandler):
                             provider = excluded.provider,
                             raw_provider_json = excluded.raw_provider_json,
                             updated_at = excluded.updated_at
-                        """,
+                        """
+                    ,
                         (
                             order_id,
                             user_id,
