@@ -405,4 +405,182 @@ class Handler(BaseHTTPRequestHandler):
                 row = conn.execute(
                     "SELECT balance FROM asset_balances WHERE user_id = ? AND asset = ?",
                     (user_id, crypto_asset),
-                ).
+                ).fetchone()
+            json_response(self, 200, {"ok": True, "asset": crypto_asset, "balance": float(row[0]) if row else 0})
+            return
+
+        json_response(self, 404, {"ok": False, "error": "not_found"})
+
+    def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        raw_body, payload = read_json(self)
+
+        if url.path == "/api/deposit/create":
+            try:
+                user_id = str(payload.get("user_id", "")).strip()
+                usdt_amount = float(payload.get("usdt_amount", 0))
+                crypto_asset = clean_crypto_asset(payload.get("crypto_asset"))
+                provider_name = clean_provider(payload.get("payment_provider"))
+                if not user_id:
+                    raise ValueError("user_id_required")
+                if usdt_amount <= 0:
+                    raise ValueError("amount_must_be_positive")
+
+                nc_amount = usdt_amount
+                order_id = f"YW-{user_id}-{int(time.time())}"
+                provider = create_provider_invoice(provider_name, order_id, usdt_amount, crypto_asset)
+                invoice_url = provider_invoice_url(provider)
+                if not invoice_url:
+                    raise RuntimeError(f"provider_invoice_url_missing: {json.dumps(provider, ensure_ascii=False)}")
+                provider_payment_id = get_provider_payment_id(provider)
+                now = int(time.time())
+                with sqlite3.connect(DATABASE_PATH) as conn:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO deposits (
+                            order_id, user_id, usdt_amount, nc_amount,
+                            crypto_asset, provider, provider_payment_id, invoice_url, raw_provider_json,
+                            created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            order_id,
+                            user_id,
+                            usdt_amount,
+                            nc_amount,
+                            crypto_asset,
+                            provider_name,
+                            provider_payment_id,
+                            invoice_url,
+                            json.dumps(provider),
+                            now,
+                            now,
+                        ),
+                    )
+                    deposit_id = cursor.lastrowid
+
+                json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "deposit_id": deposit_id,
+                        "order_id": order_id,
+                        "invoice_url": invoice_url,
+                        "usdt_amount": usdt_amount,
+                        "crypto_asset": crypto_asset,
+                        "nc_amount": nc_amount,
+                        "provider": provider_name,
+                    },
+                )
+            except Exception as error:
+                json_response(self, 400, {"ok": False, "error": str(error)})
+            return
+
+        if url.path == "/api/deposit/register-cryptopay":
+            try:
+                user_id = str(payload.get("user_id", "")).strip()
+                order_id = str(payload.get("order_id", "")).strip()
+                invoice_url = str(payload.get("invoice_url", "")).strip()
+                provider_payment_id = str(payload.get("provider_payment_id", "")).strip()
+                usdt_amount = float(payload.get("usdt_amount", 0))
+                if not user_id:
+                    raise ValueError("user_id_required")
+                if not order_id:
+                    raise ValueError("order_id_required")
+                if not invoice_url:
+                    raise ValueError("invoice_url_required")
+                if usdt_amount <= 0:
+                    raise ValueError("amount_must_be_positive")
+
+                crypto_asset = clean_crypto_asset(payload.get("crypto_asset"))
+                nc_amount = usdt_amount
+                now = int(time.time())
+                with sqlite3.connect(DATABASE_PATH) as conn:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO deposits (
+                            order_id, user_id, usdt_amount, nc_amount,
+                            crypto_asset, provider, provider_payment_id, invoice_url, raw_provider_json,
+                            created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(order_id) DO UPDATE SET
+                            invoice_url = excluded.invoice_url,
+                            provider_payment_id = excluded.provider_payment_id,
+                            crypto_asset = excluded.crypto_asset,
+                            provider = excluded.provider,
+                            raw_provider_json = excluded.raw_provider_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            order_id,
+                            user_id,
+                            usdt_amount,
+                            nc_amount,
+                            crypto_asset,
+                            "cryptopay",
+                            provider_payment_id,
+                            invoice_url,
+                            json.dumps(payload),
+                            now,
+                            now,
+                        ),
+                    )
+                    row = conn.execute(
+                        "SELECT id FROM deposits WHERE order_id = ?",
+                        (order_id,),
+                    ).fetchone()
+                    deposit_id = row[0] if row else cursor.lastrowid
+
+                json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "deposit_id": deposit_id,
+                        "order_id": order_id,
+                        "invoice_url": invoice_url,
+                        "usdt_amount": usdt_amount,
+                        "nc_amount": nc_amount,
+                        "crypto_asset": crypto_asset,
+                        "provider": "cryptopay",
+                    },
+                )
+            except Exception as error:
+                json_response(self, 400, {"ok": False, "error": str(error)})
+            return
+
+        if url.path == "/api/deposit/webhook/cryptopay":
+            signature = self.headers.get("crypto-pay-api-signature", "")
+            if not verify_crypto_pay_signature(raw_body, signature):
+                json_response(self, 401, {"ok": False, "error": "bad_signature"})
+                return
+
+            invoice = payload.get("payload") if payload.get("update_type") == "invoice_paid" else payload
+            if not isinstance(invoice, dict):
+                invoice = payload
+            order_id = str(invoice.get("payload", ""))
+            status = str(invoice.get("status", "")).lower()
+            result = credit_deposit(order_id, status, payload, CRYPTO_PAY_PAID_STATUSES)
+            json_response(self, 200, {"ok": True, **result})
+            return
+
+        json_response(self, 404, {"ok": False, "error": "not_found"})
+
+    def log_message(self, fmt, *args):
+        print("[%s] %s" % (self.log_date_time_string(), fmt % args))
+
+
+def main():
+    setup_database()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"YouWin crypto backend running on http://{HOST}:{PORT}")
+    print("Provider:", PAYMENT_PROVIDER)
+    print("Crypto Pay webhook URL:", f"{BACKEND_PUBLIC_URL}/api/deposit/webhook/cryptopay")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
