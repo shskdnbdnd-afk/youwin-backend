@@ -177,15 +177,14 @@ def create_provider_invoice(provider, order_id, usdt_amount, crypto_asset=None):
 
 def provider_invoice_url(provider):
     return (
-        provider.get("bot_invoice_url")
-        or provider.get("mini_app_invoice_url")
+        provider.get("mini_app_invoice_url")
         or provider.get("web_app_invoice_url")
         or provider.get("invoice_url")
+        or provider.get("bot_invoice_url")
         or provider.get("payment_url")
         or provider.get("pay_url")
         or provider.get("url")
     )
-
 
 def get_provider_payment_id(provider):
     return str(
