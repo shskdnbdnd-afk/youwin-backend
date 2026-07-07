@@ -1,4 +1,3 @@
-
 import hashlib
 import hmac
 import json
@@ -32,19 +31,22 @@ load_env()
 HOST = os.getenv("CRYPTO_BACKEND_HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", os.getenv("CRYPTO_BACKEND_PORT", "8787")))
 DATABASE_PATH = BASE_DIR / os.getenv("CRYPTO_DATABASE_PATH", "crypto_deposits.sqlite3")
-WEB_APP_ORIGIN = os.getenv("WEB_APP_ORIGIN", "https://bucolic-paprenjak-5d3093.netlify.app")
+WEB_APP_ORIGIN = os.getenv("WEB_APP_ORIGIN", "https://sage-hamster-baa15b.netlify.app")
+WEB_APP_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.getenv("WEB_APP_ORIGINS", WEB_APP_ORIGIN).split(",")
+    if origin.strip()
+}
 BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "").rstrip("/")
-PAYMENT_PROVIDER = "cryptopay"
+PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "cryptopay").strip().lower()
 CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN", "")
 CRYPTO_PAY_API_BASE = os.getenv("CRYPTO_PAY_API_BASE", "https://pay.crypt.bot")
 CRYPTO_PAY_ASSET = os.getenv("CRYPTO_PAY_ASSET", "USDT")
-NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "")
-NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
-NOWPAYMENTS_API_BASE = os.getenv("NOWPAYMENTS_API_BASE", "https://api.nowpayments.io")
 NC_PER_USDT = int(os.getenv("NC_PER_USDT", "10"))
 
-PAID_STATUSES = {"confirmed", "finished", "sending", "partially_paid"}
 CRYPTO_PAY_PAID_STATUSES = {"paid"}
+SUPPORTED_CRYPTO_PAY_ASSETS = {"USDT", "TON", "BTC", "ETH", "LTC", "BNB", "TRX", "USDC"}
+SUPPORTED_PROVIDERS = {"cryptopay", "telegram_wallet"}
 
 
 def setup_database():
@@ -67,6 +69,12 @@ def setup_database():
             )
             """
         )
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(deposits)").fetchall()
+        }
+        if "provider" not in columns:
+            conn.execute("ALTER TABLE deposits ADD COLUMN provider TEXT NOT NULL DEFAULT 'cryptopay'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS balances (
@@ -80,36 +88,31 @@ def setup_database():
 
 def json_response(handler, status, payload):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request_origin = handler.headers.get("Origin", "").rstrip("/")
+    allow_origin = request_origin if request_origin in WEB_APP_ORIGINS else WEB_APP_ORIGIN.rstrip("/")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Access-Control-Allow-Origin", WEB_APP_ORIGIN)
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, x-nowpayments-sig, crypto-pay-api-signature")
+    handler.send_header("Access-Control-Allow-Origin", allow_origin)
+    handler.send_header("Vary", "Origin")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, crypto-pay-api-signature")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
 
 
+def redirect_response(handler, location):
+    handler.send_response(302)
+    handler.send_header("Location", location)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
+
+
 def read_json(handler):
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length) if length else b"{}"
     return raw, json.loads(raw.decode("utf-8") or "{}")
-
-
-def stable_json_for_signature(raw_body):
-    payload = json.loads(raw_body.decode("utf-8") or "{}")
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-
-
-def verify_nowpayments_signature(raw_body, signature):
-    if not NOWPAYMENTS_IPN_SECRET:
-        return False
-    digest = hmac.new(
-        NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
-        stable_json_for_signature(raw_body),
-        hashlib.sha512,
-    ).hexdigest()
-    return hmac.compare_digest(digest, signature or "")
 
 
 def verify_crypto_pay_signature(raw_body, signature):
@@ -120,16 +123,27 @@ def verify_crypto_pay_signature(raw_body, signature):
     return hmac.compare_digest(digest, signature or "")
 
 
-def create_crypto_pay_invoice(order_id, usdt_amount):
+def clean_crypto_asset(asset):
+    asset = str(asset or CRYPTO_PAY_ASSET or "USDT").strip().upper()
+    return asset if asset in SUPPORTED_CRYPTO_PAY_ASSETS else "USDT"
+
+
+def clean_provider(provider):
+    provider = str(provider or PAYMENT_PROVIDER or "cryptopay").strip().lower()
+    return provider if provider in SUPPORTED_PROVIDERS else "cryptopay"
+
+
+def create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset=None):
     if not CRYPTO_PAY_API_TOKEN:
         raise RuntimeError("CRYPTO_PAY_API_TOKEN is missing in environment variables")
     if not BACKEND_PUBLIC_URL:
         raise RuntimeError("BACKEND_PUBLIC_URL is missing in environment variables")
 
+    crypto_asset = clean_crypto_asset(crypto_asset)
     payload = {
-        "asset": CRYPTO_PAY_ASSET,
+        "asset": crypto_asset,
         "amount": str(usdt_amount),
-        "description": "YouWin USDT top up",
+        "description": f"YouWin {crypto_asset} top up",
         "payload": order_id,
         "expires_in": 3600,
     }
@@ -157,42 +171,8 @@ def create_crypto_pay_invoice(order_id, usdt_amount):
     return data.get("result", {})
 
 
-def create_nowpayments_invoice(order_id, usdt_amount):
-    if not NOWPAYMENTS_API_KEY:
-        raise RuntimeError("NOWPAYMENTS_API_KEY is missing in .env")
-    if not BACKEND_PUBLIC_URL:
-        raise RuntimeError("BACKEND_PUBLIC_URL is missing in .env")
-
-    payload = {
-        "price_amount": usdt_amount,
-        "price_currency": "usd",
-        "pay_currency": "usdttrc20",
-        "order_id": order_id,
-        "order_description": "YouWin USDT top up",
-        "ipn_callback_url": f"{BACKEND_PUBLIC_URL}/api/deposit/webhook/nowpayments",
-        "success_url": WEB_APP_ORIGIN,
-        "cancel_url": WEB_APP_ORIGIN,
-    }
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        f"{NOWPAYMENTS_API_BASE}/v1/invoice",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": NOWPAYMENTS_API_KEY,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=35) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"NOWPayments HTTP {error.code}: {details}") from error
-
-
-def create_provider_invoice(order_id, usdt_amount):
-    return create_crypto_pay_invoice(order_id, usdt_amount)
+def create_provider_invoice(provider, order_id, usdt_amount, crypto_asset=None):
+    return create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset)
 
 
 def provider_invoice_url(provider):
@@ -217,7 +197,7 @@ def get_provider_payment_id(provider):
 
 
 def credit_deposit(order_id, provider_status, raw_payload, paid_statuses=None):
-    paid_statuses = paid_statuses or PAID_STATUSES
+    paid_statuses = paid_statuses or CRYPTO_PAY_PAID_STATUSES
     now = int(time.time())
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -272,8 +252,55 @@ class Handler(BaseHTTPRequestHandler):
                     "service": "youwin-crypto-backend",
                     "provider": PAYMENT_PROVIDER,
                     "crypto_pay_base": CRYPTO_PAY_API_BASE,
+                    "providers": sorted(SUPPORTED_PROVIDERS),
                 },
             )
+            return
+
+        if url.path == "/api/deposit/quick":
+            try:
+                user_id = str(params.get("user_id", ["guest"])[0]).strip() or "guest"
+                usdt_amount = float(params.get("usdt_amount", ["10"])[0])
+                crypto_asset = clean_crypto_asset(params.get("crypto_asset", ["USDT"])[0])
+                if usdt_amount <= 0:
+                    raise ValueError("amount_must_be_positive")
+
+                nc_amount = int(usdt_amount * NC_PER_USDT)
+                order_id = f"YW-{user_id}-{int(time.time())}"
+                provider = create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset)
+                invoice_url = provider_invoice_url(provider)
+                if not invoice_url:
+                    raise RuntimeError(f"provider_invoice_url_missing: {json.dumps(provider, ensure_ascii=False)}")
+                provider_payment_id = get_provider_payment_id(provider)
+                now = int(time.time())
+
+                with sqlite3.connect(DATABASE_PATH) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO deposits (
+                            order_id, user_id, usdt_amount, nc_amount,
+                            provider, provider_payment_id, invoice_url, raw_provider_json,
+                            created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            order_id,
+                            user_id,
+                            usdt_amount,
+                            nc_amount,
+                            "cryptopay",
+                            provider_payment_id,
+                            invoice_url,
+                            json.dumps(provider),
+                            now,
+                            now,
+                        ),
+                    )
+
+                redirect_response(self, invoice_url)
+            except Exception as error:
+                json_response(self, 400, {"ok": False, "error": str(error)})
             return
 
         if url.path == "/api/deposit/status":
@@ -281,7 +308,7 @@ class Handler(BaseHTTPRequestHandler):
             with sqlite3.connect(DATABASE_PATH) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
-                    "SELECT status, credited, nc_amount FROM deposits WHERE id = ?",
+                    "SELECT status, credited, nc_amount, provider FROM deposits WHERE id = ?",
                     (deposit_id,),
                 ).fetchone()
             if not row:
@@ -295,6 +322,7 @@ class Handler(BaseHTTPRequestHandler):
                     "status": row["status"],
                     "credited": bool(row["credited"]),
                     "nc_amount": row["nc_amount"],
+                    "provider": row["provider"],
                 },
             )
             return
@@ -322,6 +350,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 user_id = str(payload.get("user_id", "")).strip()
                 usdt_amount = float(payload.get("usdt_amount", 0))
+                crypto_asset = clean_crypto_asset(payload.get("crypto_asset"))
+                provider_name = clean_provider(payload.get("payment_provider"))
                 if not user_id:
                     raise ValueError("user_id_required")
                 if usdt_amount <= 0:
@@ -329,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 nc_amount = int(usdt_amount * NC_PER_USDT)
                 order_id = f"YW-{user_id}-{int(time.time())}"
-                provider = create_provider_invoice(order_id, usdt_amount)
+                provider = create_provider_invoice(provider_name, order_id, usdt_amount, crypto_asset)
                 invoice_url = provider_invoice_url(provider)
                 if not invoice_url:
                     raise RuntimeError(f"provider_invoice_url_missing: {json.dumps(provider, ensure_ascii=False)}")
@@ -340,16 +370,17 @@ class Handler(BaseHTTPRequestHandler):
                         """
                         INSERT INTO deposits (
                             order_id, user_id, usdt_amount, nc_amount,
-                            provider_payment_id, invoice_url, raw_provider_json,
+                            provider, provider_payment_id, invoice_url, raw_provider_json,
                             created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             order_id,
                             user_id,
                             usdt_amount,
                             nc_amount,
+                            provider_name,
                             provider_payment_id,
                             invoice_url,
                             json.dumps(provider),
@@ -368,92 +399,13 @@ class Handler(BaseHTTPRequestHandler):
                         "order_id": order_id,
                         "invoice_url": invoice_url,
                         "usdt_amount": usdt_amount,
+                        "crypto_asset": crypto_asset,
                         "nc_amount": nc_amount,
-                        "provider": PAYMENT_PROVIDER,
+                        "provider": provider_name,
                     },
                 )
             except Exception as error:
                 json_response(self, 400, {"ok": False, "error": str(error)})
-            return
-
-        if url.path == "/api/deposit/register-cryptopay":
-            try:
-                user_id = str(payload.get("user_id", "")).strip()
-                order_id = str(payload.get("order_id", "")).strip()
-                invoice_url = str(payload.get("invoice_url", "")).strip()
-                provider_payment_id = str(payload.get("provider_payment_id", "")).strip()
-                usdt_amount = float(payload.get("usdt_amount", 0))
-                if not user_id:
-                    raise ValueError("user_id_required")
-                if not order_id:
-                    raise ValueError("order_id_required")
-                if not invoice_url:
-                    raise ValueError("invoice_url_required")
-                if usdt_amount <= 0:
-                    raise ValueError("amount_must_be_positive")
-
-                nc_amount = int(usdt_amount * NC_PER_USDT)
-                now = int(time.time())
-                with sqlite3.connect(DATABASE_PATH) as conn:
-                    cursor = conn.execute(
-                        """
-                        INSERT INTO deposits (
-                            order_id, user_id, usdt_amount, nc_amount,
-                            provider_payment_id, invoice_url, raw_provider_json,
-                            created_at, updated_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(order_id) DO UPDATE SET
-                            invoice_url = excluded.invoice_url,
-                            provider_payment_id = excluded.provider_payment_id,
-                            raw_provider_json = excluded.raw_provider_json,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            order_id,
-                            user_id,
-                            usdt_amount,
-                            nc_amount,
-                            provider_payment_id,
-                            invoice_url,
-                            json.dumps(payload),
-                            now,
-                            now,
-                        ),
-                    )
-                    row = conn.execute(
-                        "SELECT id FROM deposits WHERE order_id = ?",
-                        (order_id,),
-                    ).fetchone()
-                    deposit_id = row[0] if row else cursor.lastrowid
-
-                json_response(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        "deposit_id": deposit_id,
-                        "order_id": order_id,
-                        "invoice_url": invoice_url,
-                        "usdt_amount": usdt_amount,
-                        "nc_amount": nc_amount,
-                        "provider": "cryptopay",
-                    },
-                )
-            except Exception as error:
-                json_response(self, 400, {"ok": False, "error": str(error)})
-            return
-
-        if url.path == "/api/deposit/webhook/nowpayments":
-            signature = self.headers.get("x-nowpayments-sig", "")
-            if not verify_nowpayments_signature(raw_body, signature):
-                json_response(self, 401, {"ok": False, "error": "bad_signature"})
-                return
-
-            order_id = str(payload.get("order_id", ""))
-            status = str(payload.get("payment_status", payload.get("status", ""))).lower()
-            result = credit_deposit(order_id, status, payload)
-            json_response(self, 200, {"ok": True, **result})
             return
 
         if url.path == "/api/deposit/webhook/cryptopay":
@@ -483,7 +435,6 @@ def main():
     print(f"YouWin crypto backend running on http://{HOST}:{PORT}")
     print("Provider:", PAYMENT_PROVIDER)
     print("Crypto Pay webhook URL:", f"{BACKEND_PUBLIC_URL}/api/deposit/webhook/cryptopay")
-    print("NOWPayments webhook URL:", f"{BACKEND_PUBLIC_URL}/api/deposit/webhook/nowpayments")
     server.serve_forever()
 
 
