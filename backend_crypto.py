@@ -45,7 +45,7 @@ CRYPTO_PAY_API_BASE = os.getenv("CRYPTO_PAY_API_BASE", "https://pay.crypt.bot")
 CRYPTO_PAY_ASSET = os.getenv("CRYPTO_PAY_ASSET", "USDT")
 TELEGRAM_WALLET_URL = os.getenv("TELEGRAM_WALLET_URL", "https://t.me/wallet")
 CRYPTO_PAY_PAID_STATUSES = {"paid"}
-SUPPORTED_CRYPTO_PAY_ASSETS = {"USDT", "TON", "BTC", "ETH", "LTC", "BNB", "TRX", "USDC"}
+SUPPORTED_CRYPTO_PAY_ASSETS = {"USDT", "TON", "BTC", "ETH"}
 SUPPORTED_PROVIDERS = {"cryptopay", "telegram_wallet"}
 
 
