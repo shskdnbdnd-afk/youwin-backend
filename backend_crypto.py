@@ -548,4 +548,10 @@ def main():
     setup_database()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"YouWin crypto backend running on http://{HOST}:{PORT}")
-    print("Provider
+    print("Provider:", PAYMENT_PROVIDER)
+    print("Crypto Pay webhook URL:", f"{BACKEND_PUBLIC_URL}/api/deposit/webhook/cryptopay")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
