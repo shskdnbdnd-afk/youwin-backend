@@ -236,29 +236,6 @@ def create_crypto_pay_invoice(order_id, pay_amount, crypto_asset=None):
     return provider
 
 
-def create_telegram_wallet_payment(order_id, pay_amount, crypto_asset=None):
-    crypto_asset = clean_crypto_asset(crypto_asset)
-    crypto_amount = format_crypto_amount(pay_amount)
-    query = urllib.parse.urlencode(
-        {
-            "start": f"youwin_{order_id}_{crypto_amount}_{crypto_asset}",
-        }
-    )
-    wallet_url = TELEGRAM_WALLET_URL
-    if "?" in wallet_url:
-        invoice_url = f"{wallet_url}&{query}"
-    else:
-        invoice_url = f"{wallet_url}?{query}"
-    return {
-        "id": order_id,
-        "invoice_url": invoice_url,
-        "provider": "telegram_wallet",
-        "youwin_pay_amount": pay_amount,
-        "youwin_crypto_asset": crypto_asset,
-        "youwin_crypto_amount": crypto_amount,
-    }
-
-
 def create_provider_invoice(provider, order_id, usdt_amount, crypto_asset=None):
     provider = clean_provider(provider)
     return create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset)
