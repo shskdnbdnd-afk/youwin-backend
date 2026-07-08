@@ -236,6 +236,46 @@ def create_crypto_pay_invoice(order_id, pay_amount, crypto_asset=None):
     return provider
 
 
+def get_crypto_pay_invoice(provider_payment_id):
+    provider_payment_id = str(provider_payment_id or "").strip()
+    if not provider_payment_id:
+        return None
+
+    result = crypto_pay_api("getInvoices", {"invoice_ids": provider_payment_id}) or {}
+    if isinstance(result, list):
+        return result[0] if result else None
+    if isinstance(result, dict):
+        items = result.get("items") or result.get("invoices") or []
+        if items:
+            return items[0]
+        if str(result.get("invoice_id") or result.get("id") or "") == provider_payment_id:
+            return result
+    return None
+
+
+def create_telegram_wallet_payment(order_id, pay_amount, crypto_asset=None):
+    crypto_asset = clean_crypto_asset(crypto_asset)
+    crypto_amount = format_crypto_amount(pay_amount)
+    query = urllib.parse.urlencode(
+        {
+            "start": f"youwin_{order_id}_{crypto_amount}_{crypto_asset}",
+        }
+    )
+    wallet_url = TELEGRAM_WALLET_URL
+    if "?" in wallet_url:
+        invoice_url = f"{wallet_url}&{query}"
+    else:
+        invoice_url = f"{wallet_url}?{query}"
+    return {
+        "id": order_id,
+        "invoice_url": invoice_url,
+        "provider": "telegram_wallet",
+        "youwin_pay_amount": pay_amount,
+        "youwin_crypto_asset": crypto_asset,
+        "youwin_crypto_amount": crypto_amount,
+    }
+
+
 def create_provider_invoice(provider, order_id, usdt_amount, crypto_asset=None):
     provider = clean_provider(provider)
     return create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset)
@@ -477,12 +517,36 @@ class Handler(BaseHTTPRequestHandler):
             with sqlite3.connect(DATABASE_PATH) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
-                    "SELECT status, credited, nc_amount, crypto_asset, provider FROM deposits WHERE id = ?",
+                    """
+                    SELECT id, order_id, status, credited, nc_amount, crypto_asset, provider, provider_payment_id
+                    FROM deposits
+                    WHERE id = ?
+                    """,
                     (deposit_id,),
                 ).fetchone()
             if not row:
                 json_response(self, 404, {"ok": False, "error": "deposit_not_found"})
                 return
+
+            if row["provider"] == "cryptopay" and not bool(row["credited"]):
+                try:
+                    invoice = get_crypto_pay_invoice(row["provider_payment_id"])
+                    if invoice:
+                        provider_status = str(invoice.get("status", "")).lower()
+                        credit_deposit(row["order_id"], provider_status, invoice, CRYPTO_PAY_PAID_STATUSES)
+                        with sqlite3.connect(DATABASE_PATH) as conn:
+                            conn.row_factory = sqlite3.Row
+                            row = conn.execute(
+                                """
+                                SELECT id, order_id, status, credited, nc_amount, crypto_asset, provider, provider_payment_id
+                                FROM deposits
+                                WHERE id = ?
+                                """,
+                                (deposit_id,),
+                            ).fetchone()
+                except Exception:
+                    pass
+
             json_response(
                 self,
                 200,
@@ -493,6 +557,44 @@ class Handler(BaseHTTPRequestHandler):
                     "nc_amount": row["nc_amount"],
                     "crypto_asset": row["crypto_asset"],
                     "provider": row["provider"],
+                },
+            )
+            return
+
+        if url.path == "/api/deposit/recent":
+            user_id = params.get("user_id", [""])[0]
+            if not user_id:
+                json_response(self, 400, {"ok": False, "error": "user_id_required"})
+                return
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT id, status, credited, nc_amount, crypto_asset, provider, created_at
+                    FROM deposits
+                    WHERE user_id = ? AND provider = 'cryptopay'
+                    ORDER BY id DESC
+                    LIMIT 10
+                    """,
+                    (user_id,),
+                ).fetchall()
+            json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "deposits": [
+                        {
+                            "deposit_id": row["id"],
+                            "status": row["status"],
+                            "credited": bool(row["credited"]),
+                            "nc_amount": row["nc_amount"],
+                            "crypto_asset": row["crypto_asset"],
+                            "provider": row["provider"],
+                            "created_at": row["created_at"],
+                        }
+                        for row in rows
+                    ],
                 },
             )
             return
@@ -797,3 +899,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
