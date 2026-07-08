@@ -47,23 +47,19 @@ TELEGRAM_WALLET_URL = os.getenv("TELEGRAM_WALLET_URL", "https://t.me/wallet")
 CRYPTO_PAY_PAID_STATUSES = {"paid"}
 SUPPORTED_CRYPTO_PAY_ASSETS = {"USDT", "TON", "BTC", "ETH"}
 SUPPORTED_PROVIDERS = {"cryptopay", "direct_crypto"}
-
 DIRECT_WALLETS = {
     "USDT": {
-        "network": "TRC20",
-        "address": os.getenv("DIRECT_USDT_TRC20_ADDRESS", "THX7cd5voYJKHGKwhcA7SWwsqBJT8HTepB"),
+        "TRC20": os.getenv("DIRECT_USDT_TRC20_ADDRESS", "THX7cd5voYJKHGKwhcA7SWwsqBJT8HTepB"),
+        "ERC20": os.getenv("DIRECT_USDT_ERC20_ADDRESS", "0x3efeDfFaD839006b3DDa4543fcd6b1909f8Ba9E7"),
     },
     "TON": {
-        "network": "TON",
-        "address": os.getenv("DIRECT_TON_ADDRESS", "UQCf82JLZi2zzfQ_zGnzTNDGaL4MJVEFtA7kuA4ks07q00Vg"),
+        "TON": os.getenv("DIRECT_TON_ADDRESS", "UQCf82JLZi2zzfQ_zGnzTNDGaL4MJVEFtA7kuA4ks07q00Vg"),
     },
     "BTC": {
-        "network": "BTC",
-        "address": os.getenv("DIRECT_BTC_ADDRESS", "bc1q4pl0q29yvpl3ut6rpvcjvkcxr8sh3swxpafthv"),
+        "BTC": os.getenv("DIRECT_BTC_ADDRESS", "bc1q4pl0q29yvpl3ut6rpvcjvkcxr8sh3swxpafthv"),
     },
     "ETH": {
-        "network": "ERC20",
-        "address": os.getenv("DIRECT_ETH_ADDRESS", "0x3efeDfFaD839006b3DDa4543fcd6b1909f8Ba9E7"),
+        "ERC20": os.getenv("DIRECT_ETH_ADDRESS", "0x3efeDfFaD839006b3DDa4543fcd6b1909f8Ba9E7"),
     },
 }
 
@@ -166,6 +162,15 @@ def clean_provider(provider):
     return provider if provider in SUPPORTED_PROVIDERS else "cryptopay"
 
 
+def clean_direct_network(asset, network=None):
+    asset = clean_crypto_asset(asset)
+    network = str(network or "").strip().upper()
+    available = DIRECT_WALLETS.get(asset, {})
+    if network in available:
+        return network
+    return next(iter(available.keys()), asset)
+
+
 def format_crypto_amount(value):
     quantized = Decimal(str(value)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     return format(quantized.normalize(), "f")
@@ -231,17 +236,39 @@ def create_crypto_pay_invoice(order_id, pay_amount, crypto_asset=None):
     return provider
 
 
+def create_telegram_wallet_payment(order_id, pay_amount, crypto_asset=None):
+    crypto_asset = clean_crypto_asset(crypto_asset)
+    crypto_amount = format_crypto_amount(pay_amount)
+    query = urllib.parse.urlencode(
+        {
+            "start": f"youwin_{order_id}_{crypto_amount}_{crypto_asset}",
+        }
+    )
+    wallet_url = TELEGRAM_WALLET_URL
+    if "?" in wallet_url:
+        invoice_url = f"{wallet_url}&{query}"
+    else:
+        invoice_url = f"{wallet_url}?{query}"
+    return {
+        "id": order_id,
+        "invoice_url": invoice_url,
+        "provider": "telegram_wallet",
+        "youwin_pay_amount": pay_amount,
+        "youwin_crypto_asset": crypto_asset,
+        "youwin_crypto_amount": crypto_amount,
+    }
+
+
 def create_provider_invoice(provider, order_id, usdt_amount, crypto_asset=None):
     provider = clean_provider(provider)
-    if provider == "direct_crypto":
-        raise RuntimeError("use /api/deposit/direct/create for direct crypto")
     return create_crypto_pay_invoice(order_id, usdt_amount, crypto_asset)
 
 
-def create_direct_crypto_payment(user_id, amount, crypto_asset):
+def create_direct_crypto_payment(user_id, amount, crypto_asset, network=None):
     crypto_asset = clean_crypto_asset(crypto_asset)
-    wallet = DIRECT_WALLETS.get(crypto_asset)
-    if not wallet or not wallet.get("address"):
+    network = clean_direct_network(crypto_asset, network)
+    address = DIRECT_WALLETS.get(crypto_asset, {}).get(network, "")
+    if not address:
         raise RuntimeError(f"direct_wallet_missing:{crypto_asset}")
 
     order_id = f"YW-DIRECT-{user_id}-{int(time.time())}"
@@ -251,8 +278,8 @@ def create_direct_crypto_payment(user_id, amount, crypto_asset):
         "provider": "direct_crypto",
         "order_id": order_id,
         "asset": crypto_asset,
-        "network": wallet["network"],
-        "address": wallet["address"],
+        "network": network,
+        "address": address,
         "requested_amount": float(amount),
         "pay_amount": float(pay_amount),
     }
@@ -287,11 +314,12 @@ def create_direct_crypto_payment(user_id, amount, crypto_asset):
 def check_direct_payment(deposit):
     details = json.loads(deposit["raw_provider_json"] or "{}")
     asset = str(deposit["crypto_asset"]).upper()
+    network = str(details.get("network") or clean_direct_network(asset)).upper()
     address = details.get("address", "")
     expected = Decimal(str(deposit["usdt_amount"]))
     created_at = int(deposit["created_at"] or 0) - 180
 
-    if asset == "USDT":
+    if asset == "USDT" and network == "TRC20":
         url = (
             f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20"
             "?limit=50&contract_address=TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcd"
@@ -309,6 +337,24 @@ def check_direct_payment(deposit):
             amount = Decimal(str(tx.get("value", "0"))) / (Decimal(10) ** decimals)
             if amount >= expected:
                 return {"found": True, "txid": tx.get("transaction_id"), "amount": float(amount), "raw": tx}
+
+    if asset == "USDT" and network == "ERC20":
+        api_key = os.getenv("ETHERSCAN_API_KEY", "")
+        url = (
+            "https://api.etherscan.io/api?module=account&action=tokentx"
+            "&contractaddress=0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            f"&address={address}&sort=desc&page=1&offset=50&apikey={api_key}"
+        )
+        data = http_get_json(url)
+        for tx in data.get("result", []):
+            if str(tx.get("to", "")).lower() != address.lower():
+                continue
+            if int(tx.get("timeStamp", 0)) < created_at:
+                continue
+            decimals = int(tx.get("tokenDecimal", 6))
+            amount = Decimal(str(tx.get("value", 0))) / (Decimal(10) ** decimals)
+            if amount >= expected:
+                return {"found": True, "txid": tx.get("hash"), "amount": float(amount), "raw": tx}
 
     if asset == "BTC":
         data = http_get_json(f"https://mempool.space/api/address/{address}/txs")
@@ -444,6 +490,7 @@ class Handler(BaseHTTPRequestHandler):
                     "provider": PAYMENT_PROVIDER,
                     "crypto_pay_base": CRYPTO_PAY_API_BASE,
                     "providers": sorted(SUPPORTED_PROVIDERS),
+                    "telegram_wallet_url": TELEGRAM_WALLET_URL,
                 },
             )
             return
@@ -656,11 +703,12 @@ class Handler(BaseHTTPRequestHandler):
                 user_id = str(payload.get("user_id", "")).strip()
                 amount = Decimal(str(payload.get("amount", "0")))
                 crypto_asset = clean_crypto_asset(payload.get("crypto_asset"))
+                network = clean_direct_network(crypto_asset, payload.get("network"))
                 if not user_id:
                     raise ValueError("user_id_required")
                 if amount <= 0:
                     raise ValueError("amount_must_be_positive")
-                direct = create_direct_crypto_payment(user_id, amount, crypto_asset)
+                direct = create_direct_crypto_payment(user_id, amount, crypto_asset, network)
                 json_response(self, 200, {"ok": True, **direct})
             except Exception as error:
                 json_response(self, 400, {"ok": False, "error": str(error)})
@@ -701,8 +749,7 @@ class Handler(BaseHTTPRequestHandler):
                             provider = excluded.provider,
                             raw_provider_json = excluded.raw_provider_json,
                             updated_at = excluded.updated_at
-                        """
-                    ,
+                        """,
                         (
                             order_id,
                             user_id,
